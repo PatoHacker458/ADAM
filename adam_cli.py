@@ -2,21 +2,19 @@
 # -*- coding: utf-8 -*-
 
 """
+adam_cli.py (Versión SQL Server)
 
-Este script contiene el motor de inferencia y la interfaz de usuario
-para manejar adecuadamente la adquisición de hechos y las variables internas.
+Este script contiene el motor de inferencia y la interfaz de usuario.
+NUEVO: Lee las reglas dinámicamente desde una base de datos SQL Server.
 """
 
-# 1. IMPORTACIÓN DE LA BASE DE CONOCIMIENTO
+import pyodbc
+import sys
 
-try:
-    from base_conocimiento import base_conocimiento
-except ImportError:
-    print("ERROR AL IMPORTAR")
-    exit()
-
-# 2. MAPA DE PREGUNTAS
-
+# ---------------------------------------------------------------------------
+# 1. MAPA DE PREGUNTAS (FRONTEND)
+# ---------------------------------------------------------------------------
+# Este mapa traduce las variables técnicas a preguntas para el usuario.
 mapa_preguntas = {
     # Módulo 1: Enfriamiento
     "indicador_temperatura": "¿El indicador de temperatura está en la zona 'ROJA'?",
@@ -49,14 +47,14 @@ mapa_preguntas = {
     "rendimiento_motor": "¿El motor 'PIERDE_POTENCIA_BAJO_CARGA' (al acelerar fuerte o en subidas)?",
     "mantenimiento_filtro_combustible": "¿El filtro de combustible es 'ANTIGUO_O_DESCONOCIDO' (más de 2 años o 40,000 km)?",
     "arranque_en_frio": "¿El arranque en frío es 'LENTO' o 'TARDA_MUCHO'?",
-    "arranque_en_frio_normal": "¿El arranque en frío es 'NORMAL'?",  # Para REGLA 026
+    "arranque_en_frio_normal": "¿El arranque en frío es 'NORMAL'?",
 
     # Módulo 3: Encendido
     "ralenti_motor": "¿El motor en ralentí (detenido) está 'INESTABLE_O_TEMBLOROSO'?",
     "mantenimiento_bujias": "¿El mantenimiento de las bujías es 'ANTIGUO_O_DESCONOCIDO'?",
     "estado_cables_bobinas": "¿Los cables de bujía o las bobinas se ven 'AGRIETADOS_O_DAÑADOS'?",
     "revoluciones_ralenti": "¿Las revoluciones en ralentí 'OSCILAN_SOLAS' (suben y bajan)?",
-    "revoluciones_ralenti_estables": "¿Las revoluciones son 'ESTABLES_PERO_EL_MOTOR_TIEMBLA'?",  # Para REGLA 031
+    "revoluciones_ralenti_estables": "¿Las revoluciones son 'ESTABLES_PERO_EL_MOTOR_TIEMBLA'?",
     "luz_check_engine": "¿La luz de 'Check Engine' está 'PARPADEANDO'?",
     "luz_check_engine_fija": "¿La luz de 'Check Engine' está 'ENCENDIDA_FIJA'?",
     "tapon_combustible": "¿Ha revisado el tapón de gasolina? ¿Estaba 'SUELTO_O_MAL_CERRADO'?",
@@ -76,8 +74,8 @@ mapa_preguntas = {
     "humo_escape_azul": "¿Sale 'HUMO_AZULADO' del tubo de escape?",
     "nivel_aceite": "¿La varilla de medir aceite muestra un nivel 'BAJO' constantemente?",
     "fuga_aceite_visible": "¿Hay 'MANCHAS_DE_ACEITE' debajo del coche?",
-    "ruido_motor_normal": "¿El motor 'SUENA_NORMAL', sin ruidos metálicos?",  # Para REGLA 082, 083
-    "nivel_aceite_correcto": "¿Verificó el nivel de aceite y está 'CORRECTO'?",  # Para REGLA 083
+    "ruido_motor_normal": "¿El motor 'SUENA_NORMAL', sin ruidos metálicos?",
+    "nivel_aceite_correcto": "¿Verificó el nivel de aceite y está 'CORRECTO'?",
 
     # Módulo 6: Frenos
     "ruido_frenos": "¿Se escucha un 'CHILLIDO_AGUDO' o un 'RUIDO_DE_ROCE_METALICO' (grinding) al frenar?",
@@ -174,144 +172,192 @@ mapa_preguntas = {
     "filtracion_agua": "¿Se encuentra 'AGUA_O_HUMEDAD_EN_LA_ALFOMBRA' después de llover?",
 }
 
-# 3. MOTOR DE INFERENCIA
+
+# ---------------------------------------------------------------------------
+# 2. MOTOR DE INFERENCIA (BACKEND CONECTADO A SQL SERVER)
+# ---------------------------------------------------------------------------
 
 class MotorDiagnostico:
+    # --- CONFIGURACIÓN DE BASE DE DATOS ---
+    # AJUSTA ESTOS VALORES SEGÚN TU INSTALACIÓN DE SQL SERVER
+    CONNECTION_STRING = (
+        r"DRIVER={ODBC Driver 17 for SQL Server};"
+        r"SERVER=MIDKNIGHT;"  # <--- IMPORTANTE: CAMBIA ESTO A TU SERVIDOR
+        r"DATABASE=ADAM_DB;"
+        r"Trusted_Connection=yes;"
+    )
 
-    def __init__(self, base_conocimiento, mapa_preguntas):
-        self.reglas = base_conocimiento
-        self.hechos = {}
+    def __init__(self, mapa_preguntas):
         self.mapa_preguntas = mapa_preguntas
+        self.hechos = {}
+
+        # Variables internas que NO se le preguntan al usuario
         self.variables_internas = {
-            "condicion",
-            "diagnostico_parcial",
-            "diagnostico_final",
-            "cilindro_afectado",
-            "accion_recomendada",
-            "diagnostico_bobina",
-            "existen_otros_codigos_falla",
-            "diagnostico_parcial",
-            "P0420_DETECTADO",
-            "MEZCLA_POBRE_P0171",
-            "MEZCLA_RICA_P0172"
+            "condicion", "diagnostico_parcial", "diagnostico_final",
+            "cilindro_afectado", "accion_recomendada", "diagnostico_bobina",
+            "existen_otros_codigos_falla", "P0420_DETECTADO",
+            "MEZCLA_POBRE_P0171", "MEZCLA_RICA_P0172"
         }
 
+        # CARGAR REGLAS DESDE SQL
+        print("Conectando a la base de datos para cargar conocimientos...")
+        self.reglas = self._cargar_reglas_desde_db()
+        print(f"Base de conocimiento cargada con éxito: {len(self.reglas)} reglas operativas.\n")
+
+    def _cargar_reglas_desde_db(self):
+        """
+        Consulta las tablas Reglas, Condiciones y Consecuencias
+        y reconstruye la estructura de lista de diccionarios.
+        """
+        lista_reglas = []
+        conn = None
+        try:
+            conn = pyodbc.connect(self.CONNECTION_STRING)
+            cursor = conn.cursor()
+
+            # Obtener todas las reglas
+            cursor.execute("SELECT ID_Regla FROM Reglas ORDER BY ID_Regla")
+            reglas_ids = cursor.fetchall()
+
+            for row in reglas_ids:
+                id_regla = row.ID_Regla
+
+                # 1. Reconstruir Condiciones ("si")
+                cursor.execute("""
+                               SELECT Variable, Valor, Operador_Siguiente
+                               FROM Condiciones
+                               WHERE ID_Regla = ?
+                               ORDER BY Orden
+                               """, (id_regla,))
+
+                condiciones_db = cursor.fetchall()
+                si_lista = []
+
+                for cond in condiciones_db:
+                    # Añadir la tupla (Variable, Valor)
+                    si_lista.append((cond.Variable, cond.Valor))
+                    # Añadir el operador si existe ('y' / 'o')
+                    if cond.Operador_Siguiente:
+                        si_lista.append(cond.Operador_Siguiente)
+
+                # 2. Reconstruir Consecuencias ("entonces")
+                cursor.execute("""
+                               SELECT Variable, Valor
+                               FROM Consecuencias
+                               WHERE ID_Regla = ?
+                               """, (id_regla,))
+
+                consecuencias_db = cursor.fetchall()
+                entonces_lista = []
+                for cons in consecuencias_db:
+                    entonces_lista.append((cons.Variable, cons.Valor))
+
+                # 3. Armar el diccionario de la regla
+                regla_dict = {
+                    "si": si_lista,
+                    "entonces": entonces_lista
+                }
+                lista_reglas.append(regla_dict)
+
+            return lista_reglas
+
+        except Exception as e:
+            print(f"\n[ERROR CRÍTICO] No se pudo conectar a la base de datos: {e}")
+            print("Verifique que SQL Server esté corriendo y la cadena de conexión sea correcta.")
+            sys.exit(1)
+        finally:
+            if conn:
+                conn.close()
+
     def _solicitar_hecho(self, variable, valor_esperado):
-
-        if variable in self.hechos:
-            return
-
-        if variable in self.variables_internas:
-            return
+        if variable in self.hechos: return
+        if variable in self.variables_internas: return
 
         if variable not in self.mapa_preguntas:
-            print(
-                f"[LOG_ERROR] No se encontró una pregunta para la variable: '{variable}'. Contactar al equipo de desarrollo.")
-            self.hechos[variable] = "error_pregunta_no_encontrada"
+            print(f"[LOG_ERROR] Pregunta no definida para: '{variable}'")
+            self.hechos[variable] = "error"
             return
 
-        # 1. Hacer la pregunta
         pregunta = self.mapa_preguntas[variable]
         print(f"\n[A.D.A.M.] {pregunta} (si/no/?)")
         respuesta = input("Usuario: ").strip().lower()
 
-        # 2. Normalizar la respuesta
-        if respuesta in ['s', 'si', 'y', 'yes', 'v', 'verdadero']:
+        if respuesta in ['s', 'si', 'y', 'yes', 'v']:
             self.hechos[variable] = valor_esperado
-
-        elif respuesta in ['n', 'no', 'f', 'falso']:
+        elif respuesta in ['n', 'no', 'f']:
             self.hechos[variable] = "no"
-
         elif respuesta == '?':
             self.hechos[variable] = "no_se"
-
         else:
             self.hechos[variable] = respuesta.upper()
 
-        print(f"[LOG] Hecho adquirido: {variable} = {self.hechos[variable]}")
+        # print(f"[LOG] Hecho: {variable} = {self.hechos[variable]}")
 
     def _evaluar_condicion(self, condicion):
         variable, valor_esperado = condicion
-
         if variable not in self.hechos:
             self._solicitar_hecho(variable, valor_esperado)
-
         return self.hechos.get(variable) == valor_esperado
 
     def _evaluar_regla(self, regla):
         condiciones = regla["si"]
-
+        # Lógica simplificada para listas mixtas (tuplas y operadores)
         if "o" in condiciones:
-            resultado_parcial = False
+            resultado = False
             for item in condiciones:
-                if item == "o":
-                    continue
+                if item == "o": continue
                 if self._evaluar_condicion(item):
-                    resultado_parcial = True
+                    resultado = True
                     break
-            return resultado_parcial
+            return resultado
         else:
-            resultado_parcial = True
+            resultado = True
             for item in condiciones:
-                if item == "y":
-                    continue
+                if item == "y": continue
                 if not self._evaluar_condicion(item):
-                    resultado_parcial = False
+                    resultado = False
                     break
-            return resultado_parcial
+            return resultado
 
     def diagnosticar(self):
-
-        print("Iniciando A.D.A.M.")
-
-        nuevos_hechos_inferidos = True
+        print("Iniciando motor de inferencia...")
+        nuevos_hechos = True
         reglas_aplicadas = set()
 
-        while nuevos_hechos_inferidos:
-            nuevos_hechos_inferidos = False
-
+        while nuevos_hechos:
+            nuevos_hechos = False
             for i, regla in enumerate(self.reglas):
-                if i in reglas_aplicadas:
-                    continue
+                if i in reglas_aplicadas: continue
 
-                    # 1. Evaluar si la regla se cumple
                 if self._evaluar_regla(regla):
-
-                    print(f"\n[LOG] Regla {i + 1} disparada.")
+                    # print(f"[LOG] Regla {i+1} disparada.") # Debug opcional
                     reglas_aplicadas.add(i)
 
-                    # 2. Si se cumple, "disparar" la regla
                     for variable, valor in regla["entonces"]:
                         if self.hechos.get(variable) != valor:
                             self.hechos[variable] = valor
-                            print(f"    -> Hecho inferido: {variable} = {valor}")
-                            nuevos_hechos_inferidos = True
+                            nuevos_hechos = True
 
-                    # 3. Si encontramos un diagnóstico final, terminamos.
                     if "diagnostico_final" in self.hechos:
-                        print("\n--- Diagnóstico Final Encontrado ---")
                         return self.hechos["diagnostico_final"]
 
-        print("\n--- Diagnóstico No Concluyente ---")
-        return "No se pudo llegar a un diagnóstico final con los síntomas proporcionados."
+        return "No se pudo determinar un diagnóstico con la información proporcionada."
 
 
-# 4. INTERFAZ DE USUARIO Y EJECUCIÓN
+# ---------------------------------------------------------------------------
+# 3. EJECUCIÓN
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     print("======================================================")
-    print("  Bienvenido a A.D.A.M.")
+    print("  Bienvenido a A.D.A.M. (Versión SQL Enterprise)")
     print("  (Asistente de Diagnóstico Automotriz Mecánico)")
     print("======================================================")
-    print("Por favor, responda a las siguientes preguntas para ayudarme a")
-    print("diagnosticar el problema de su vehículo.")
-    print("Responda con 'si', 'no' o '?' si no está seguro.")
 
-    adam = MotorDiagnostico(base_conocimiento, mapa_preguntas)
-
-    diagnostico_final = adam.diagnosticar()
+    adam = MotorDiagnostico(mapa_preguntas)
+    resultado = adam.diagnosticar()
 
     print("\n======================================================")
-    print("  DIAGNÓSTICO DE A.D.A.M.:")
+    print("  DIAGNÓSTICO FINAL:")
     print("======================================================")
-    print(diagnostico_final)
+    print(resultado)
